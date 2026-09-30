@@ -120,8 +120,9 @@ class SubtitleExtractor:
         # 打印视频帧数与帧率
         self.append_output(f"  {tr['Main']['FrameCount']}：{self.frame_count}"
               f"  |  {tr['Main']['FrameRate']}：{self.fps}")
-        # 打印加载模型信息
-        self.append_output(f"  DET: {os.path.basename(self.model_config.DET_MODEL_PATH)}  |  REC: {os.path.basename(self.model_config.REC_MODEL_PATH)}")
+        # 打印加载模型信息（打印实际生效的模型名，V6 走在线下载时本地路径会误导）
+        det_used, rec_used = self.model_config.display_model_names()
+        self.append_output(f"  DET: {det_used}  |  REC: {rec_used}")
         self.append_output('-----------------------------')
         # 打印视频帧提取开始提示
         self.append_output(tr['Main']['StartProcessFrame'])
