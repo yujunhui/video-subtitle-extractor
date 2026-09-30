@@ -1,6 +1,18 @@
 import os
 from backend.config import BASE_DIR, config
 
+# PaddleX 官方提供 ONNX 格式的模型清单(下载名为 `<model_name>_onnx`)。
+# 直接复用 PaddleX 自身的清单,避免版本漂移导致判断失准。
+try:
+    from paddlex.inference.utils.official_models import (
+        ONNX_SUPPORTED_MODELS as _ONNX_SUPPORTED_MODELS,
+    )
+except Exception:
+    _ONNX_SUPPORTED_MODELS = frozenset()
+
+# 本地预转换的 ONNX 文件名(PaddleX 约定)
+ONNX_MODEL_FILENAME = 'inference.onnx'
+
 
 class PaddleModelConfig:
     def __init__(self, hardware_accelerator):
@@ -150,3 +162,62 @@ class PaddleModelConfig:
 
         rec_model_name = self._read_model_name_from_yaml(rec_model_path)
         return det_model_path, rec_model_path, det_model_name, rec_model_name
+
+    # ------------------------------------------------------------------
+    # ONNX Runtime 推理引擎支持 (PaddleOCR >= 3.5)
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _has_local_onnx(model_dir):
+        """该模型目录下是否已有预转换好的 ONNX 模型(离线场景)。"""
+        if not model_dir:
+            return False
+        return os.path.exists(os.path.join(model_dir, ONNX_MODEL_FILENAME))
+
+    @staticmethod
+    def _is_onnx_supported(model_name):
+        """该模型是否有官方 ONNX 版本可供 PaddleX 自动下载。"""
+        return bool(model_name) and model_name in _ONNX_SUPPORTED_MODELS
+
+    def onnx_model_source(self, which):
+        """
+        返回该模型在 ONNX Runtime 引擎下的来源,形式为 ('dir'|'name', 值)。
+        无法以 ONNX 方式加载时返回 None。
+
+        优先顺序:
+          1. 本地目录下已存在 inference.onnx -> ('dir', 目录)
+          2. 有官方 ONNX 版本 -> ('name', 模型名),由 PaddleX 自动下载并缓存
+        """
+        if which not in ('text_detection', 'text_recognition'):
+            raise ValueError(f'unknown model kind: {which}')
+
+        if which == 'text_detection':
+            model_name, model_dir = self.DET_MODEL_NAME, self.DET_MODEL_PATH
+        else:
+            model_name, model_dir = self.REC_MODEL_NAME, self.REC_MODEL_PATH
+
+        if self._has_local_onnx(model_dir):
+            return 'dir', model_dir
+        if self._is_onnx_supported(model_name):
+            return 'name', model_name
+        return None
+
+    def onnx_engine_kwargs(self):
+        """
+        在 DirectML 等 ONNX Runtime 后端可用时,返回 PaddleOCR 管线所需的
+        engine / engine_config / 模型来源参数;不可用时返回 None。
+        """
+        accelerator = self.hardware_accelerator
+        engine_config = accelerator.onnx_engine_config() if accelerator else None
+        if not engine_config:
+            return None
+
+        kwargs = {'engine': 'onnxruntime', 'engine_config': engine_config}
+        for prefix in ('text_detection', 'text_recognition'):
+            source = self.onnx_model_source(prefix)
+            if source is None:
+                # 有模型无法以 ONNX 方式加载,整体回退
+                return None
+            kind, value = source
+            kwargs[f'{prefix}_model_{kind}'] = value
+        return kwargs

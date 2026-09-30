@@ -9,8 +9,8 @@ from backend.tools.paddle_model_config import PaddleModelConfig
 class OcrRecogniser:
     def __init__(self):
         self.recogniser = None
-        # 占位，应该由main.py初始化
-        self.hardware_accelerator = HardwareAccelerator()
+        # 使用已完成后端探测的单例；子进程 OCR 时由 main.py 覆盖
+        self.hardware_accelerator = HardwareAccelerator.instance()
 
     @staticmethod
     def y_round(y):
@@ -91,21 +91,39 @@ class OcrRecogniser:
         else:
             device = 'cpu'
 
-        kwargs = dict(
-            text_detection_model_dir=model_config.DET_MODEL_PATH,
-            text_recognition_model_dir=model_config.REC_MODEL_PATH,
+        common_kwargs = dict(
             use_doc_orientation_classify=False,
             use_doc_unwarping=False,
             use_textline_orientation=False,
             text_rec_score_thresh=0,
+            # 每张图中同时识别的文本框数量，批量越大 GPU 收益越明显
+            text_recognition_batch_size=config.recBatchNumber.value,
             device=device,
+        )
+
+        # 优先使用 ONNX Runtime 引擎(DirectML 等非 CUDA 后端唯一的 GPU 途径)
+        onnx_kwargs = model_config.onnx_engine_kwargs()
+        if onnx_kwargs:
+            try:
+                print(f"使用 ONNX Runtime 推理引擎: {self.hardware_accelerator.accelerator_name}")
+                return PaddleOCR(**common_kwargs, **onnx_kwargs)
+            except Exception as e:
+                print(f"ONNX Runtime 推理初始化失败，回退到默认推理引擎: {e}")
+
+        kwargs = dict(
+            text_detection_model_dir=model_config.DET_MODEL_PATH,
+            text_recognition_model_dir=model_config.REC_MODEL_PATH,
+            # paddlepaddle 3.3 + oneDNN 执行 PP-OCRv5(PIR 格式) 会抛
+            # NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support
+            # 关闭 mkldnn 可绕开该上游缺陷。
+            enable_mkldnn=False,
         )
         if model_config.DET_MODEL_NAME:
             kwargs['text_detection_model_name'] = model_config.DET_MODEL_NAME
         if model_config.REC_MODEL_NAME:
             kwargs['text_recognition_model_name'] = model_config.REC_MODEL_NAME
 
-        return PaddleOCR(**kwargs)
+        return PaddleOCR(**common_kwargs, **kwargs)
 
 
 def get_coordinates(dt_box):
