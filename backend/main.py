@@ -128,10 +128,8 @@ class SubtitleExtractor:
         subtitle_ocr_process = self.start_subtitle_ocr_async()
         if self.sub_area is not None:
             if platform.system() in ['Windows', 'Linux', 'Darwin']:
-                # 检测抽帧通常比 VideoSubFinder 更快，但需要硬件加速才划算
-                if should_use_detection_extraction(
-                        config.frameExtraction.value,
-                        self.hardware_accelerator.has_accelerator()):
+                # 检测抽帧要逐帧扫完整个视频, 只适合短片
+                if should_use_detection_extraction(config.frameExtraction.value):
                     self.extract_frame_by_det()
                 else:
                     self.extract_frame_by_vsf()

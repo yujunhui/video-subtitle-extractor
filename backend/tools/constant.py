@@ -50,16 +50,20 @@ REC_MODEL_CHOICES = (
 DEFAULT_DET_MODEL = "PP-OCRv6_small_det"
 DEFAULT_REC_MODEL = "PP-OCRv6_small_rec"
 
-# 抽帧策略。以前它是识别模式顺带管的事, 现在独立成一个选项。
-FRAME_EXTRACTION_AUTO = "auto"
+# 抽帧策略。以前它是识别模式顺带管的事, 现在独立成一个选项, 由用户自己选。
+#
+# 默认给 VideoSubFinder: 检测抽帧要把整片每一帧都过一遍检测器, 实测比 VSF 慢 3.6~6.3 倍
+# (2.4 分钟 1080p30 的视频: VSF 约 36s, 检测抽帧 130s 起, 检测模型越重越慢), 长视频上
+# 差距会拉到几百倍。旧版本的默认模式同样走 VSF, 所以默认值保持不变。
+#
+# vsf 放第一项, 这样旧配置里已经不存在的 auto 被校验器纠正时会落到它身上。
 FRAME_EXTRACTION_DETECT = "detect"
 FRAME_EXTRACTION_VSF = "vsf"
 FRAME_EXTRACTION_CHOICES = (
-    FRAME_EXTRACTION_AUTO,
-    FRAME_EXTRACTION_DETECT,
     FRAME_EXTRACTION_VSF,
+    FRAME_EXTRACTION_DETECT,
 )
-DEFAULT_FRAME_EXTRACTION = FRAME_EXTRACTION_AUTO
+DEFAULT_FRAME_EXTRACTION = FRAME_EXTRACTION_VSF
 
 # 语言分组, 用来把字幕语言映射到对应的 V5 分语种识别模型。
 LATIN_LANG = [
@@ -103,11 +107,11 @@ V5_EQUIVALENT_MODEL = {
 # 用来把移除模式选项之前写下的 config.json 迁移过来, 保证升级后实际跑的东西不变。
 #   fast     -> 轻量模型 + VideoSubFinder 抽帧
 #   auto     -> 大模型   + VideoSubFinder 抽帧
-#   accurate -> 大模型   + 有加速器时用检测抽帧
+#   accurate -> 大模型   + 检测抽帧
 MODE_TO_MODEL_CHOICES = {
     "fast": ("PP-OCRv6_small_det", "PP-OCRv6_small_rec", FRAME_EXTRACTION_VSF),
     "auto": ("PP-OCRv6_medium_det", "PP-OCRv6_medium_rec", FRAME_EXTRACTION_VSF),
-    "accurate": ("PP-OCRv6_medium_det", "PP-OCRv6_medium_rec", FRAME_EXTRACTION_AUTO),
+    "accurate": ("PP-OCRv6_medium_det", "PP-OCRv6_medium_rec", FRAME_EXTRACTION_DETECT),
 }
 
 
@@ -191,18 +195,14 @@ def apply_v5_override(det_model, rec_model):
             V5_EQUIVALENT_MODEL.get(rec_model, rec_model))
 
 
-def should_use_detection_extraction(strategy, has_accelerator):
+def should_use_detection_extraction(strategy):
     """
-    判断该用检测抽帧还是 VideoSubFinder。
+    是否用检测抽帧。
 
-    'auto' 只在有加速器时才选检测抽帧; 纯 CPU 上它要逐帧扫完整个视频, 慢得没法用,
-    不适合做默认。
+    检测抽帧要逐帧扫完整个视频, 只适合短片。长视频上 VideoSubFinder 快几百倍, 所以这项
+    默认关着, 由用户明确选择。
     """
-    if strategy == FRAME_EXTRACTION_DETECT:
-        return True
-    if strategy == FRAME_EXTRACTION_VSF:
-        return False
-    return bool(has_accelerator)
+    return strategy == FRAME_EXTRACTION_DETECT
 
 
 BGR_COLOR_GREEN = (0, 0xff, 0)
