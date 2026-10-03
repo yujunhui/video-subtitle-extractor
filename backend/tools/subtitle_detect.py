@@ -17,37 +17,42 @@ class SubtitleDetect:
     def __init__(self):
         hardware_accelerator = HardwareAccelerator.instance()
         model_config = PaddleModelConfig(hardware_accelerator)
-        # 使用 TextDetection 公开 API（PaddleOCR 3.x）
-        default_kwargs = {'model_dir': model_config.DET_MODEL_PATH}
-        if model_config.DET_MODEL_NAME:
-            default_kwargs['model_name'] = model_config.DET_MODEL_NAME
-        # 见 ocr.py:绕开 paddlepaddle 3.3 + oneDNN 执行 PIR 格式模型的缺陷
-        default_kwargs['enable_mkldnn'] = False
+        self.text_detector = self._build_detector(model_config, hardware_accelerator)
 
-        # 优先使用 ONNX Runtime 引擎（DirectML 等非 CUDA 后端唯一的 GPU 途径）
-        engine_config = hardware_accelerator.onnx_engine_config()
-        if engine_config:
+    @staticmethod
+    def _paddle_det_kwargs(model_config):
+        """把管线风格的参数名换成 TextDetection 认的那两个。"""
+        kwargs = {'enable_mkldnn': False}
+        for key, value in model_config.paddle_engine_kwargs().items():
+            if key == 'text_detection_model_dir':
+                kwargs['model_dir'] = value
+            elif key == 'text_detection_model_name':
+                kwargs['model_name'] = value
+        return kwargs
+
+    @staticmethod
+    def _build_detector(model_config, hardware_accelerator):
+        """
+        构建检测器, 优先用 ONNX Runtime 引擎。
+
+        ONNX Runtime 是非 CUDA 显卡(如 DirectML)用上 GPU 的唯一官方途径。它初始化失败
+        就退回 paddle 引擎。
+        """
+        onnx_kwargs = model_config.onnx_engine_kwargs()
+        if onnx_kwargs:
             source = model_config.onnx_model_source('text_detection')
-            if source is not None:
-                kind, value = source
-                onnx_kwargs = dict(
-                    default_kwargs,
+            kind, value = source
+            try:
+                print(f"使用 ONNX Runtime 推理引擎: {hardware_accelerator.accelerator_name}")
+                return TextDetection(
                     engine='onnxruntime',
-                    engine_config=engine_config,
+                    engine_config=onnx_kwargs['engine_config'],
                     device='cpu',
+                    **{f'model_{kind}': value},
                 )
-                # 用 ONNX 来源覆盖默认的目录/模型名
-                onnx_kwargs.pop('model_dir', None)
-                onnx_kwargs.pop('model_name', None)
-                onnx_kwargs[f'model_{kind}'] = value
-                try:
-                    print(f"使用 ONNX Runtime 推理引擎: {hardware_accelerator.accelerator_name}")
-                    self.text_detector = TextDetection(**onnx_kwargs)
-                    return
-                except Exception as e:
-                    print(f"ONNX Runtime 推理初始化失败，回退到默认推理引擎: {e}")
-
-        self.text_detector = TextDetection(**default_kwargs)
+            except Exception as e:
+                print(f"ONNX Runtime 推理初始化失败，回退到默认推理引擎: {e}")
+        return TextDetection(**SubtitleDetect._paddle_det_kwargs(model_config))
 
     def detect_subtitle(self, img):
         """

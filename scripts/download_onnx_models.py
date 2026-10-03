@@ -1,4 +1,4 @@
-"""预下载 backend 运行所需的 PP-OCRv5 ONNX 模型。
+"""预下载 backend 运行所需的 PP-OCRv5 / PP-OCRv6 ONNX 模型。
 
 复刻 PaddleX 的缓存布局(<CACHE_DIR>/official_models/<model_name>_onnx/)，
 下载完成后应用即可离线使用，无需再联网。
@@ -24,7 +24,7 @@ python scripts/download_onnx_models.py --source huggingface --endpoint https://h
 # 国内直连 ModelScope
 python scripts/download_onnx_models.py --source modelscope
 
-# 只下 fast 模式用得到的
+# 只下 fast 档位用得到的
 python scripts/download_onnx_models.py --source modelscope --set fast
 
 # 先看看要下什么，不实际下载
@@ -92,12 +92,11 @@ def _onnx_supported_models():
         return set()
 
 
-def _resolve_models_from_local(mode_filter):
+def _resolve_models_from_local(tier_filter):
     """
-    退化方案：以「本地随仓库分发的模型」为基准，取其中有官方 ONNX 版的。
+    退化方案: 以仓库自带的模型为基准, 取其中有官方 ONNX 版的。
 
-    是精确清单的超集（会多带几个项目当前语言列表选不到的模型），
-    但完全不需要 GUI 依赖。
+    是精确清单的超集(会多带几个当前语言列表选不到的模型), 但完全不需要 GUI 依赖。
     """
     supported = _onnx_supported_models()
     if not supported:
@@ -115,36 +114,53 @@ def _resolve_models_from_local(mode_filter):
         )
 
     names = local & supported
-    # 近似区分快慢模式：fast 不含 server，accurate 不需要 mobile det / 通用 mobile rec
-    if mode_filter == "fast":
-        names = {n for n in names if "server" not in n}
-    elif mode_filter == "accurate":
-        names = {n for n in names if not (n == "PP-OCRv5_mobile_rec" or "mobile_det" in n)}
+    names = _filter_by_tier(names, tier_filter)
     return {n for n in names if "det" in n}, {n for n in names if "det" not in n}
 
 
-def resolve_models(mode_filter, langs=None):
+def _filter_by_tier(names, tier_filter):
     """
-    推导出「语言 x 模式」组合下会用到的模型名，返回 (det_names, rec_names)。
+    按档位筛选模型名。
 
-    优先用项目自身的 PaddleModelConfig（唯一真源）；若当前环境缺少 GUI 依赖
-    （qfluentwidgets/PySide6），则退化为扫描本地模型目录。
+    注意分语种模型只有 mobile 一档, 所以任何档位都要保留。档位是靠子串匹配的, 以后改型号
+    命名时这里要跟着改。
+    """
+    if tier_filter not in ("fast", "accurate"):
+        return set(names)
+    if tier_filter == "fast":
+        wanted = ("v6_small", "v5_mobile")
+    else:
+        wanted = ("v6_medium", "v5_server")
+    out = set()
+    for name in names:
+        lower = name.lower()
+        if any(w in lower for w in wanted):
+            out.add(name)
+        elif lower.startswith(("latin_", "arabic_", "cyrillic_", "devanagari_", "korean_",
+                               "th_", "el_", "ta_", "te_", "eslav_")):
+            out.add(name)
+    return out
+
+
+def resolve_models(tier_filter, langs=None):
+    """
+    推导出需要预下载的 ONNX 模型名, 返回 (det_names, rec_names)。
+
+    两部分都要: 界面下拉里的全部候选, 以及列出的语言可能用到的 V5 分语种识别模型。
+
+    优先用项目自己的模型清单(唯一真源); 当前环境缺 GUI 依赖时退化成扫描本地模型目录。
     """
     sys.path.insert(0, BASE_DIR)
     os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
     try:
         from backend.config import config
-        from backend.tools.hardware_accelerator import HardwareAccelerator
-        from backend.tools.paddle_model_config import PaddleModelConfig
+        from backend.tools import constant as model_catalog
     except ImportError as e:
         print(f"注意: 无法导入项目模块({type(e).__name__}: {e})")
         print("      改用本地模型目录清单(超集)。如需精确清单，请用应用所在环境运行：")
         print("      conda activate vse-lion\n")
-        return _resolve_models_from_local(mode_filter)
-
-    accelerator = HardwareAccelerator()      # 仅用于构造，不做后端探测
-    accelerator.set_enabled(False)
+        return _resolve_models_from_local(tier_filter)
 
     available_langs = list(config.language.validator.options)
     use_langs = langs or available_langs
@@ -152,28 +168,13 @@ def resolve_models(mode_filter, langs=None):
     if invalid:
         raise SystemExit(f"未知语言: {invalid}\n可选: {available_langs}")
 
-    modes = [mode_filter] if mode_filter in ("fast", "accurate") else ["fast", "accurate"]
-
-    det, rec = set(), set()
-    original = (config.language.value, config.mode.value)
-    config_file = os.path.join(BASE_DIR, "config", "config.json")
-    config_existed = os.path.exists(config_file)
-    try:
-        for lang in use_langs:
-            for mode in modes:
-                config.set(config.language, lang)
-                config.set(config.mode, mode)
-                mc = PaddleModelConfig(accelerator)
-                if mc.DET_MODEL_NAME:
-                    det.add(mc.DET_MODEL_NAME)
-                if mc.REC_MODEL_NAME:
-                    rec.add(mc.REC_MODEL_NAME)
-    finally:
-        config.set(config.language, original[0])
-        config.set(config.mode, original[1])
-        if not config_existed and os.path.exists(config_file):
-            os.remove(config_file)
-
+    det = _filter_by_tier(set(model_catalog.DET_MODEL_CHOICES), tier_filter)
+    rec = _filter_by_tier(set(model_catalog.REC_MODEL_CHOICES), tier_filter)
+    # 分语种模型在任何档位都可能被用到(V6 覆盖不到的语种)
+    for lang in use_langs:
+        lang_model = model_catalog.v5_lang_rec_model(lang)
+        if lang_model:
+            rec.add(lang_model)
     return det, rec
 
 
@@ -321,7 +322,7 @@ def main():
         dest="mode_set",
         default="all",
         choices=["all", "fast", "accurate"],
-        help="只下载某个识别模式会用到的模型(默认 all)",
+        help="只下载某个档位会用到的模型(默认 all)。fast=V6 small+V5 mobile，accurate=V6 medium+V5 server；分语种模型任何档位都会包含",
     )
     parser.add_argument("--langs", default=None, help="逗号分隔的语言子集，默认全部")
     parser.add_argument(
@@ -352,7 +353,7 @@ def main():
 
     print(f"下载源     : {args.source}" + (f"  (endpoint={args.endpoint})" if args.source == "huggingface" else ""))
     print(f"缓存目录   : {args.cache_dir}")
-    print(f"模式       : {args.mode_set}    语言数: {len(langs) if langs else '全部'}")
+    print(f"档位       : {args.mode_set}    语言数: {len(langs) if langs else '全部'}")
     print(f"需要模型   : {len(models)} 个\n")
 
     for var, label in (("HTTP_PROXY", "HTTP_PROXY"), ("HTTPS_PROXY", "HTTPS_PROXY"), ("ALL_PROXY", "ALL_PROXY")):

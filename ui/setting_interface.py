@@ -35,17 +35,6 @@ class SettingInterface(QtWidgets.QVBoxLayout):
         )
         self.addWidget(self.language_combo)
 
-        # 识别模式设置
-        self.mode_combo = ComboBoxSettingCard(
-            configItem=config.mode,
-            icon=FluentIcon.SETTING,
-            title=tr["LanguageModeGUI"]["Mode"],
-            content="",
-            parent=parent,
-            texts=[tr['Mode'][i] for i in config.mode.validator.options],
-        )
-        self.addWidget(self.mode_combo)
-           
         # 是否启用硬件加速
         self.hardware_acceleration = SwitchSettingCard(
             configItem=config.hardwareAcceleration,

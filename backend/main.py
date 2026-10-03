@@ -32,6 +32,7 @@ from backend.tools.paddle_model_config import PaddleModelConfig
 from backend.tools.process_manager import ProcessManager
 from backend.tools.subtitle_detect import SubtitleDetect
 from backend.bean.subtitle_area import SubtitleArea
+from backend.tools.constant import FRAME_EXTRACTION_DETECT, should_use_detection_extraction
 import threading
 import platform
 import multiprocessing
@@ -111,18 +112,7 @@ class SubtitleExtractor:
         # 重置进度条
         self.update_progress(ocr=0, frame_extract=0, post=0)
         self.append_output('-----------------------------')
-        # 打印识别语言与识别模式
-        self.append_output(f"  {tr['Main']['RecSubLang']}：{config.language.value}  |  {tr['Main']['RecMode']}：{config.mode.value}")
-        # 如果使用GPU加速，则打印GPU加速提示
-        if self.hardware_accelerator.has_accelerator():
-            self.append_output(f"  {tr['Main']['AcceleratorON'].format(self.hardware_accelerator.accelerator_name)}")
-
-        # 打印视频帧数与帧率
-        self.append_output(f"  {tr['Main']['FrameCount']}：{self.frame_count}"
-              f"  |  {tr['Main']['FrameRate']}：{self.fps}")
-        # 打印加载模型信息（打印实际生效的模型名，V6 走在线下载时本地路径会误导）
-        det_used, rec_used = self.model_config.display_model_names()
-        self.append_output(f"  DET: {det_used}  |  REC: {rec_used}")
+        self._log_model_selection()
         self.append_output('-----------------------------')
         # 打印视频帧提取开始提示
         self.append_output(tr['Main']['StartProcessFrame'])
@@ -138,8 +128,10 @@ class SubtitleExtractor:
         subtitle_ocr_process = self.start_subtitle_ocr_async()
         if self.sub_area is not None:
             if platform.system() in ['Windows', 'Linux', 'Darwin']:
-                # 使用GPU且使用accurate模式时才开放此方法：
-                if self.hardware_accelerator.has_accelerator() and config.mode.value == 'accurate':
+                # 检测抽帧通常比 VideoSubFinder 更快，但需要硬件加速才划算
+                if should_use_detection_extraction(
+                        config.frameExtraction.value,
+                        self.hardware_accelerator.has_accelerator()):
                     self.extract_frame_by_det()
                 else:
                     self.extract_frame_by_vsf()
@@ -197,6 +189,32 @@ class SubtitleExtractor:
         self.lock.release()
         if config.generateTxt.value:
             self.srt2txt(self.subtitle_output_path)
+
+    def _log_model_selection(self):
+        """
+        打印这次实际生效的模型与抽帧策略。
+
+        检测抽帧要逐帧扫完整个视频, 没加速器还选它就额外给一条性能提示。
+
+        抽帧策略的取值是内部标识('auto' 这种), 跟用户在界面上看到的字不一样, 所以查翻译
+        再打, 不直接打原始值。
+        """
+        extraction_label = tr['FrameExtraction'][config.frameExtraction.value]
+        self.append_output(
+            f"  {tr['Main']['RecSubLang']}：{config.language.value}"
+            f"  |  {tr['Main']['FrameExtraction']}：{extraction_label}")
+        if self.hardware_accelerator.has_accelerator():
+            self.append_output(
+                f"  {tr['Main']['AcceleratorON'].format(self.hardware_accelerator.accelerator_name)}")
+        self.append_output(f"  {tr['Main']['FrameCount']}：{self.frame_count}"
+                           f"  |  {tr['Main']['FrameRate']}：{self.fps}")
+        det_used, rec_used = self.model_config.display_model_names()
+        self.append_output(f"  DET: {det_used}  |  REC: {rec_used}")
+        for note in self.model_config.fallback_notes:
+            self.append_output(f"  {tr['Main']['ModelFallback']}：{note}")
+        if (config.frameExtraction.value == FRAME_EXTRACTION_DETECT
+                and not self.hardware_accelerator.has_accelerator()):
+            self.append_output(f"  {tr['Main']['DetectWithoutAccelerator']}")
 
     def capture_frame_with_subtitle_area(self):
         """
@@ -482,8 +500,12 @@ class SubtitleExtractor:
         if config.videoSubFinderCpuCores.value > 0:
             cpu_count = config.videoSubFinderCpuCores.value
         if platform.system() == 'Windows':
-            # 定义执行命令
-            cmd = f"{path_vsf} --use_cuda -c -r -i \"{self.video_path}\" -o \"{self.temp_output_dir}\" -ces \"{self.vsf_subtitle}\" "
+            # VideoSubFinder 只认 CUDA 加速, 只有 DirectML 不算数; 关掉硬件加速时也不能带
+            # 这个标志。
+            cmd = f"{path_vsf}"
+            if self.hardware_accelerator.has_cuda():
+                cmd += " --use_cuda"
+            cmd += f" -c -r -i \"{self.video_path}\" -o \"{self.temp_output_dir}\" -ces \"{self.vsf_subtitle}\" "
             cmd += f"-te {top_end} -be {bottom_end} -le {left_end} -re {right_end} -nthr {cpu_count} -nocrthr {cpu_count} "
             cmd += f"--open_video_{config.videoSubFinderDecoder.value.value.lower()} "
             # 计算进度
@@ -501,7 +523,7 @@ class SubtitleExtractor:
         else:
             # 定义执行命令
             cmd = f"{path_vsf} -c -r -i \"{self.video_path}\" -o \"{self.temp_output_dir}\" -ces \"{self.vsf_subtitle}\" "
-            if self.hardware_accelerator.has_accelerator():
+            if self.hardware_accelerator.has_cuda():
                 cmd += "--use_cuda "
             cmd += f"-te {top_end} -be {bottom_end} -le {left_end} -re {right_end} -nthr {cpu_count} -dsi "
             cmd += f"--open_video_{config.videoSubFinderDecoder.value.value.lower()} "

@@ -1,8 +1,11 @@
 import os
 from backend.config import BASE_DIR, config
+from backend.tools.constant import (
+    V5_EQUIVALENT_MODEL, resolve_det_model, resolve_rec_model, apply_v5_override,
+)
 
 # PaddleX 官方提供 ONNX 格式的模型清单(下载名为 `<model_name>_onnx`)。
-# 直接复用 PaddleX 自身的清单,避免版本漂移导致判断失准。
+# 直接复用 PaddleX 自己的清单, 免得硬编码一份以后跟着版本漂移。
 try:
     from paddlex.inference.utils.official_models import (
         ONNX_SUPPORTED_MODELS as _ONNX_SUPPORTED_MODELS,
@@ -13,116 +16,124 @@ except Exception:
 # 本地预转换的 ONNX 文件名(PaddleX 约定)
 ONNX_MODEL_FILENAME = 'inference.onnx'
 
-# ---------------------------------------------------------------------------
-# PP-OCRv6 支持
-#
-# 经实测(见下), V6 统一模型覆盖 简体/繁体中文 + 日文 + 46 种拉丁语系 + 希腊文,
-# 但不含 韩文/西里尔/阿拉伯/天城文/泰米尔/泰卢固 —— 这些语种必须继续用
-# V5 的分语种模型(字典里分别有 11504 个谚文 / 409 个西里尔 / 274 个阿拉伯 /
-# 128 个天城文字符, 而 V6 为 0)。
-#
-# 简繁中文小字/劣化素材上的实测 CER(200 条合成字幕行):
-#   V5_mobile_rec 12.55% | V5_server_rec 9.74%
-#   V6_small_rec   9.36% | V6_medium_rec 7.58%
-# V6_tiny_rec 被排除: 字典仅 6904 字, 缺 19 个常用繁体字
-# (說錢麼幾頁認繼續讓帳資軟擇...), 会把繁体系统性识别成简体。
-# ---------------------------------------------------------------------------
-
-# 可用 V6 的语种(按字典字集实测确定)
-V6_REC_LANGS = frozenset(
-    ['ch', 'chinese_cht', 'japan', 'en', 'el',
-     'af', 'az', 'bs', 'cs', 'cy', 'da', 'de', 'es', 'et', 'fr', 'ga', 'hr',
-     'hu', 'id', 'is', 'it', 'ku', 'la', 'lt', 'lv', 'mi', 'ms', 'mt', 'nl',
-     'no', 'oc', 'pi', 'pl', 'pt', 'ro', 'rs_latin', 'sk', 'sl', 'sq', 'sv',
-     'sw', 'tl', 'tr', 'uz', 'vi', 'latin', 'german', 'french']
-)
-
-# 识别模式 -> V6 档位
-V6_TIER_BY_MODE = {'fast': 'small', 'auto': 'medium', 'accurate': 'medium'}
-
-# 允许通过环境变量回退到 V5 模型(便于对比/排障)
+# 排障开关: 设为 0 时按档位把 V6 型号降级成 V5 等价型号, 优先级高于界面选择。
 USE_V6_MODELS = os.environ.get('VSE_USE_V6_MODELS', '1').lower() not in ('0', 'false', 'no')
 
 
 class PaddleModelConfig:
     def __init__(self, hardware_accelerator):
         self.hardware_accelerator = hardware_accelerator
-        # 设置识别语言
         self.REC_CHAR_TYPE = config.language.value
 
-        # 模型文件目录
         self.MODEL_BASE = os.path.join(BASE_DIR, 'models')
-        # 模型版本 V5
+        # 仓库自带的模型是 V5
         self.MODEL_VERSION = 'V5'
-        # V5模型默认图形识别的shape为3, 48, 320
+        # V5 识别模型要求的输入尺寸
         self.REC_IMAGE_SHAPE = '3,48,320'
-        # 初始化模型路径
         self.REC_MODEL_PATH = None
         self.DET_MODEL_PATH = None
         self.DET_MODEL_NAME = None
         self.REC_MODEL_NAME = None
+        # 模型被替换的原因, 启动日志会打出来
+        self.fallback_notes = []
 
-        # 语言组定义
-        self.LATIN_LANG = [
-            'af', 'az', 'bs', 'cs', 'cy', 'da', 'de', 'es', 'et', 'fr', 'ga', 'hr',
-            'hu', 'id', 'is', 'it', 'ku', 'la', 'lt', 'lv', 'mi', 'ms', 'mt', 'nl',
-            'no', 'oc', 'pi', 'pl', 'pt', 'ro', 'rs_latin', 'sk', 'sl', 'sq', 'sv',
-            'sw', 'tl', 'tr', 'uz', 'vi', 'latin', 'german', 'french',
-            'fi', 'eu', 'gl', 'lb', 'rm', 'ca', 'qu',
-        ]
-        self.ARABIC_LANG = ['ar', 'fa', 'ug', 'ur', 'ps', 'sd', 'bal']
-        self.CYRILLIC_LANG = [
-            'ru', 'rs_cyrillic', 'be', 'bg', 'uk', 'mn', 'abq', 'ady', 'kbd', 'ava',
-            'dar', 'inh', 'che', 'lbe', 'lez', 'tab', 'cyrillic',
-            'sr', 'kk', 'ky', 'tg', 'mk', 'tt', 'cv', 'ba', 'mhr', 'mo',
-            'udm', 'kv', 'os', 'bua', 'xal', 'tyv', 'sah', 'kaa',
-        ]
-        self.DEVANAGARI_LANG = [
-            'hi', 'mr', 'ne', 'bh', 'mai', 'ang', 'bho', 'mah', 'sck', 'new', 'gom',
-            'sa', 'bgc', 'devanagari',
-        ]
-        self.OTHER_LANG = [
-            'ch', 'japan', 'korean', 'en', 'ta', 'kn', 'te', 'ka',
-            'chinese_cht',
-        ]
-        self.MULTI_LANG = (self.LATIN_LANG + self.ARABIC_LANG + self.CYRILLIC_LANG
-                           + self.DEVANAGARI_LANG + self.OTHER_LANG)
+        self._resolve_selected_models()
 
-        # 如果设置了识别文本语言类型，则设置为对应的语言
-        if self.REC_CHAR_TYPE in self.MULTI_LANG:
-            resolved = self._resolve_models()
-            if resolved:
-                self.MODEL_VERSION = 'V5'
-                self.DET_MODEL_PATH, self.REC_MODEL_PATH, self.DET_MODEL_NAME, self.REC_MODEL_NAME = resolved
-
-    def _get_v5_rec_model_name(self, lang):
+    def _local_model_dirs(self):
         """
-        根据语言获取V5识别模型目录名
-        参考: https://www.paddleocr.ai/main/version3.x/algorithm/PP-OCRv5/PP-OCRv5_multi_languages.html
+        扫描 MODEL_BASE 下的模型目录, 建立 官方模型名 -> 本地目录 的映射。
+
+        模型名从各目录的 inference.yml 里读 Global.model_name。按 sorted() 顺序先到
+        先得, 所以万一两个目录声明了同一个模型名, V5 那个会静默胜出。
         """
-        if lang in ('ch', 'chinese_cht', 'japan'):
-            return 'PP-OCRv5_server_rec_infer'
-        elif lang == 'en':
-            return 'PP-OCRv5_server_rec_infer'
-        elif lang == 'korean':
-            return 'korean_PP-OCRv5_mobile_rec_infer'
-        elif lang in self.LATIN_LANG:
-            return 'latin_PP-OCRv5_mobile_rec_infer'
-        elif lang in self.ARABIC_LANG:
-            return 'arabic_PP-OCRv5_mobile_rec_infer'
-        elif lang in self.CYRILLIC_LANG:
-            return 'cyrillic_PP-OCRv5_mobile_rec_infer'
-        elif lang in self.DEVANAGARI_LANG:
-            return 'devanagari_PP-OCRv5_mobile_rec_infer'
-        elif lang == 'th':
-            return 'th_PP-OCRv5_mobile_rec_infer'
-        elif lang == 'el':
-            return 'el_PP-OCRv5_mobile_rec_infer'
-        elif lang == 'ta':
-            return 'ta_PP-OCRv5_mobile_rec_infer'
-        elif lang == 'te':
-            return 'te_PP-OCRv5_mobile_rec_infer'
-        return None
+        mapping = {}
+        if not os.path.isdir(self.MODEL_BASE):
+            return mapping
+        for version in sorted(os.listdir(self.MODEL_BASE)):
+            version_dir = os.path.join(self.MODEL_BASE, version)
+            if not os.path.isdir(version_dir):
+                continue
+            for dirname in sorted(os.listdir(version_dir)):
+                model_dir = os.path.join(version_dir, dirname)
+                if not os.path.isdir(model_dir):
+                    continue
+                model_name = self._read_model_name_from_yaml(model_dir)
+                if model_name and model_name not in mapping:
+                    mapping[model_name] = model_dir
+        return mapping
+
+    def _downgrade_to_local(self, det, rec, local_dirs):
+        """
+        把没有本地目录的型号换成同档位的 V5 型号。
+
+        paddle 路径只能加载仓库自带的东西, 而 V6 只有 ONNX 格式。
+        """
+        out = []
+        for model in (det, rec):
+            if model in local_dirs:
+                out.append(model)
+                continue
+            equivalent = V5_EQUIVALENT_MODEL.get(model, model)
+            if equivalent != model:
+                self.fallback_notes.append(
+                    f'{model} 无法用 ONNX 加载，改用仓库自带的 {equivalent}')
+            out.append(equivalent)
+        return out[0], out[1]
+
+    def _onnx_reachable(self, det, rec, local_dirs):
+        """
+        两个模型是否都能真正交给 ONNX Runtime 引擎。
+
+        比 HardwareAccelerator.use_onnx_engine 严格: 那个只回答"有没有 ONNX provider",
+        而这里还要求每个模型要么本地有 inference.onnx, 要么官方发了 ONNX 版。只要有一个
+        不满足, 整条流水线就得留在 paddle 上。
+
+        必须和 onnx_engine_kwargs() 保持一致: 那个方法返回 None 的情形, 正是这里拒绝的
+        情形。两者不一致是出过 bug 的, 当时模型既没有本地目录, paddle 兜底也没东西可加载,
+        于是跑去联网下载。
+
+        返回 True 表示 onnx_engine_kwargs() 会产出可用的配置。
+        """
+        accelerator = self.hardware_accelerator
+        if not (accelerator and accelerator.use_onnx_engine):
+            return False
+        for model in (det, rec):
+            if self._has_local_onnx(local_dirs.get(model)):
+                continue
+            if self._is_onnx_supported(model):
+                continue
+            return False
+        return True
+
+    def _resolve_selected_models(self):
+        """
+        把界面上的选择换算成这次实际要加载的模型。
+
+        有三件事会顶掉用户的选择:
+          1. 识别模型读不了所选字幕语言
+          2. VSE_USE_V6_MODELS=0, 把 V6 降级成 V5 等价型号
+          3. ONNX 引擎用不了, 只剩仓库自带的本地模型
+        """
+        det, det_note = resolve_det_model(config.detModel.value)
+        rec, rec_note = resolve_rec_model(config.recModel.value, self.REC_CHAR_TYPE)
+        if det_note:
+            self.fallback_notes.append(det_note)
+        if rec_note:
+            self.fallback_notes.append(rec_note)
+
+        if not USE_V6_MODELS:
+            det, rec = apply_v5_override(det, rec)
+            self.fallback_notes.append(
+                'VSE_USE_V6_MODELS=0，V6 型号已按档位换成 V5 等价型号')
+
+        local_dirs = self._local_model_dirs()
+        if not self._onnx_reachable(det, rec, local_dirs):
+            det, rec = self._downgrade_to_local(det, rec, local_dirs)
+
+        self.DET_MODEL_NAME = det
+        self.REC_MODEL_NAME = rec
+        self.DET_MODEL_PATH = local_dirs.get(det)
+        self.REC_MODEL_PATH = local_dirs.get(rec)
 
     @staticmethod
     def _read_model_name_from_yaml(model_dir):
@@ -149,50 +160,6 @@ class PaddleModelConfig:
             pass
         return None
 
-    def _resolve_models(self):
-        """
-        解析 V5 模型路径，返回 (det_model_path, rec_model_path, det_model_name, rec_model_name) 或 None
-        """
-        v5_base = os.path.join(self.MODEL_BASE, 'V5')
-
-        # 快速模式优先使用 mobile 模型，否则使用 server 模型
-        if config.mode.value == 'fast':
-            det_model_path = os.path.join(v5_base, 'PP-OCRv5_mobile_det_infer')
-            if not os.path.exists(det_model_path):
-                det_model_path = os.path.join(v5_base, 'PP-OCRv5_server_det_infer')
-        else:
-            det_model_path = os.path.join(v5_base, 'PP-OCRv5_server_det_infer')
-        if not os.path.exists(det_model_path):
-            return None
-
-        det_model_name = self._read_model_name_from_yaml(det_model_path)
-
-        # 快速模式：中文(简/繁)、英文、日文使用通用 mobile 模型，其他语言使用对应的专用模型
-        if config.mode.value == 'fast' and self.REC_CHAR_TYPE in ('ch', 'chinese_cht', 'en', 'japan'):
-            rec_model_path = os.path.join(v5_base, 'PP-OCRv5_mobile_rec_infer')
-            if os.path.exists(rec_model_path):
-                rec_model_name = self._read_model_name_from_yaml(rec_model_path)
-                return det_model_path, rec_model_path, det_model_name, rec_model_name
-            # mobile 不存在则 fallback 到按语言选择
-
-        # 获取识别模型
-        rec_model_dir_name = self._get_v5_rec_model_name(self.REC_CHAR_TYPE)
-        if rec_model_dir_name is None:
-            return None
-
-        rec_model_path = os.path.join(v5_base, f'{rec_model_dir_name}_infer'
-                                      if not rec_model_dir_name.endswith('_infer')
-                                      else rec_model_dir_name)
-
-        if not os.path.exists(rec_model_path):
-            rec_model_path = os.path.join(v5_base, rec_model_dir_name)
-
-        if not os.path.exists(rec_model_path):
-            return None
-
-        rec_model_name = self._read_model_name_from_yaml(rec_model_path)
-        return det_model_path, rec_model_path, det_model_name, rec_model_name
-
     # ------------------------------------------------------------------
     # ONNX Runtime 推理引擎支持 (PaddleOCR >= 3.5)
     # ------------------------------------------------------------------
@@ -206,46 +173,23 @@ class PaddleModelConfig:
 
     @staticmethod
     def _is_onnx_supported(model_name):
-        """该模型是否有官方 ONNX 版本可供 PaddleX 自动下载。"""
+        """该模型是否有官方 ONNX 版可供 PaddleX 自动下载。"""
         return bool(model_name) and model_name in _ONNX_SUPPORTED_MODELS
-
-    def v6_model_names(self):
-        """
-        当前「语言 + 识别模式」下应使用的 V6 模型名,返回 (det_name, rec_name)。
-        语言不在 V6 覆盖范围内(韩/阿/西里尔/天城文等)时返回 None。
-        """
-        if not USE_V6_MODELS:
-            return None
-        if self.REC_CHAR_TYPE not in V6_REC_LANGS:
-            return None
-        tier = V6_TIER_BY_MODE.get(config.mode.value, 'medium')
-        det = f'PP-OCRv6_{tier}_det'
-        rec = f'PP-OCRv6_{tier}_rec'
-        if not (self._is_onnx_supported(det) and self._is_onnx_supported(rec)):
-            return None
-        return det, rec
 
     def onnx_model_source(self, which):
         """
-        返回该模型在 ONNX Runtime 引擎下的来源,形式为 ('dir'|'name', 值)。
-        无法以 ONNX 方式加载时返回 None。
+        该模型在 ONNX Runtime 引擎下该从哪里加载。
 
-        优先顺序:
-          1. PP-OCRv6 统一模型(仅 ONNX 路径可用,实测简繁中文 CER 更低)
-          2. 本地目录下已存在 inference.onnx -> ('dir', 目录)
-          3. 有官方 ONNX 版本 -> ('name', 模型名),由 PaddleX 自动下载并缓存
+        本地已有 inference.onnx 就优先用目录, 否则给模型名让 PaddleX 下载转换。
+
+        参数 which 只接受 'text_detection' / 'text_recognition', 传别的会抛 ValueError。
         """
-        if which not in ('text_detection', 'text_recognition'):
-            raise ValueError(f'unknown model kind: {which}')
-
-        v6 = self.v6_model_names()
-        if v6 is not None:
-            return 'name', (v6[0] if which == 'text_detection' else v6[1])
-
         if which == 'text_detection':
             model_name, model_dir = self.DET_MODEL_NAME, self.DET_MODEL_PATH
-        else:
+        elif which == 'text_recognition':
             model_name, model_dir = self.REC_MODEL_NAME, self.REC_MODEL_PATH
+        else:
+            raise ValueError(f'unknown model kind: {which}')
 
         if self._has_local_onnx(model_dir):
             return 'dir', model_dir
@@ -255,21 +199,45 @@ class PaddleModelConfig:
 
     def display_model_names(self):
         """
-        实际会被加载的 检测/识别 模型名,用于启动日志与排障。
-        (V6 走在线下载时 DET/REC_MODEL_PATH 仍指向本地 V5 目录,直接打印会误导。)
+        实际会被加载的 检测/识别 模型标识, 用于启动日志与排障。
+
+        只有两个模型都走通了 ONNX 才报 ONNX 名字。以前只看 onnx_engine_config(),
+        只要某个模型没有 ONNX 版, 这里就打成 "None", 排障时很误导。
         """
-        det = self.onnx_model_source('text_detection') if self.hardware_accelerator \
-            and self.hardware_accelerator.onnx_engine_config() else None
-        if det is None:
-            return (os.path.basename(self.DET_MODEL_PATH) if self.DET_MODEL_PATH else 'None',
-                    os.path.basename(self.REC_MODEL_PATH) if self.REC_MODEL_PATH else 'None')
-        rec = self.onnx_model_source('text_recognition')
-        return det[1], (rec[1] if rec else 'None')
+        det_source = self.onnx_model_source('text_detection')
+        rec_source = self.onnx_model_source('text_recognition')
+        if det_source and rec_source:
+            return det_source[1], rec_source[1]
+        det = os.path.basename(self.DET_MODEL_PATH) if self.DET_MODEL_PATH \
+            else (self.DET_MODEL_NAME or 'None')
+        rec = os.path.basename(self.REC_MODEL_PATH) if self.REC_MODEL_PATH \
+            else (self.REC_MODEL_NAME or 'None')
+        return det, rec
+
+    def paddle_engine_kwargs(self):
+        """
+        默认(paddle)推理引擎所需的模型参数。
+
+        本地有目录就给目录, 不给模型名: 两个都传是多余的, 而且传了和目录不一致的名字
+        PaddleX 会直接报错。
+        """
+        kwargs = {}
+        for prefix, model_name, model_dir in (
+            ('text_detection', self.DET_MODEL_NAME, self.DET_MODEL_PATH),
+            ('text_recognition', self.REC_MODEL_NAME, self.REC_MODEL_PATH),
+        ):
+            if model_dir:
+                kwargs[f'{prefix}_model_dir'] = model_dir
+            elif model_name:
+                kwargs[f'{prefix}_model_name'] = model_name
+        return kwargs
 
     def onnx_engine_kwargs(self):
         """
-        在 DirectML 等 ONNX Runtime 后端可用时,返回 PaddleOCR 管线所需的
-        engine / engine_config / 模型来源参数;不可用时返回 None。
+        在 DirectML 等 ONNX Runtime 后端可用时, 返回 PaddleOCR 管线所需的
+        engine / engine_config / 模型来源参数; 不可用时返回 None。
+
+        返回 None 是"留在 paddle"的信号, 调用方要把它当回退而不是错误。
         """
         accelerator = self.hardware_accelerator
         engine_config = accelerator.onnx_engine_config() if accelerator else None

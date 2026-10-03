@@ -101,7 +101,7 @@ class OcrRecogniser:
             device=device,
         )
 
-        # 优先使用 ONNX Runtime 引擎(DirectML 等非 CUDA 后端唯一的 GPU 途径)
+        # 优先使用 ONNX Runtime 引擎: 它是非 CUDA 显卡(DirectML 等)用上 GPU 的唯一官方途径
         onnx_kwargs = model_config.onnx_engine_kwargs()
         if onnx_kwargs:
             try:
@@ -110,18 +110,11 @@ class OcrRecogniser:
             except Exception as e:
                 print(f"ONNX Runtime 推理初始化失败，回退到默认推理引擎: {e}")
 
-        kwargs = dict(
-            text_detection_model_dir=model_config.DET_MODEL_PATH,
-            text_recognition_model_dir=model_config.REC_MODEL_PATH,
-            # paddlepaddle 3.3 + oneDNN 执行 PP-OCRv5(PIR 格式) 会抛
-            # NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support
-            # 关闭 mkldnn 可绕开该上游缺陷。
-            enable_mkldnn=False,
-        )
-        if model_config.DET_MODEL_NAME:
-            kwargs['text_detection_model_name'] = model_config.DET_MODEL_NAME
-        if model_config.REC_MODEL_NAME:
-            kwargs['text_recognition_model_name'] = model_config.REC_MODEL_NAME
+        # paddlepaddle 3.3 + oneDNN 跑 PP-OCRv5(PIR 格式) 会抛
+        # NotImplementedError: ConvertPirAttribute2RuntimeAttribute not support
+        # 关掉 mkldnn 绕开这个上游缺陷。
+        kwargs = {'enable_mkldnn': False}
+        kwargs.update(model_config.paddle_engine_kwargs())
 
         return PaddleOCR(**common_kwargs, **kwargs)
 

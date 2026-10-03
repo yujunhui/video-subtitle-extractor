@@ -5,15 +5,169 @@ import sys
 
 from PySide6 import QtWidgets, QtCore, QtGui
 from PySide6.QtWidgets import QFileDialog
-from qfluentwidgets import (ScrollArea, ExpandLayout, CardWidget, SubtitleLabel,
+from qfluentwidgets import (ScrollArea, ExpandLayout,
                            FluentIcon, NavigationWidget, NavigationItemPosition,
                            SettingCardGroup, RangeSettingCard, SwitchSettingCard,
                            HyperlinkCard, PrimaryPushSettingCard, ComboBoxSettingCard, PushSettingCard,
-                           MessageBox)
-from backend.config import config, tr, VERSION, PROJECT_HOME_URL, PROJECT_ISSUES_URL, PROJECT_RELEASES_URL
+                           ExpandGroupSettingCard, ComboBox, isDarkTheme,
+                           MessageBox, qconfig)
+from backend.config import (config, tr, tr_fallback, VERSION, PROJECT_HOME_URL,
+                            PROJECT_ISSUES_URL, PROJECT_RELEASES_URL)
 from backend.tools.version_service import VersionService
 from backend.tools.concurrent import TaskExecutor
 from backend.tools.constant import VideoSubFinderDecoder
+
+class HelpIconButton(QtWidgets.QAbstractButton):
+    """
+    问号帮助按钮, 用来替换 ExpandSettingCard 自带的旋转箭头。
+
+    刻意不继承 qfluentwidgets 的按钮: 它们的 __init__ 被一个自定义 overload 装饰器包着,
+    装饰器内部会调 self.__init__(...), 到了子类身上这个 self.__init__ 又指回子类, 于是
+    无限递归。这里只实现 HeaderSettingCard 会调的三个方法。
+    """
+
+    BUTTON_SIZE = 30
+    ICON_SIZE = 16
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.BUTTON_SIZE, self.BUTTON_SIZE)
+        self.setCheckable(True)
+        self.isHover = False
+        self.isPressed = False
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHints(QtGui.QPainter.Antialiasing
+                               | QtGui.QPainter.SmoothPixmapTransform)
+        r = 255 if isDarkTheme() else 0
+
+        if not self.isEnabled():
+            painter.setOpacity(0.36)
+            color = QtCore.Qt.transparent
+        elif self.isPressed:
+            color = QtGui.QColor(r, r, r, 10)
+        elif self.isHover:
+            color = QtGui.QColor(r, r, r, 14)
+        elif self.isChecked():
+            color = QtGui.QColor(r, r, r, 10)
+        else:
+            color = QtCore.Qt.transparent
+
+        painter.setPen(QtCore.Qt.NoPen)
+        painter.setBrush(color)
+        painter.drawRoundedRect(self.rect(), 4, 4)
+
+        # 用和「开发配置」页一样的问号字形, 而不是文字 "?"
+        offset = (self.BUTTON_SIZE - self.ICON_SIZE) / 2
+        FluentIcon.QUESTION.render(
+            painter, QtCore.QRectF(offset, offset, self.ICON_SIZE, self.ICON_SIZE))
+
+    def enterEvent(self, event):
+        self.setHover(True)
+
+    def leaveEvent(self, event):
+        self.setHover(False)
+
+    def mousePressEvent(self, event):
+        super().mousePressEvent(event)
+        self.setPressed(True)
+
+    def mouseReleaseEvent(self, event):
+        super().mouseReleaseEvent(event)
+        self.setPressed(False)
+
+    def setHover(self, isHover):
+        self.isHover = isHover
+        self.update()
+
+    def setPressed(self, isPressed):
+        self.isPressed = isPressed
+        self.update()
+
+    def setExpand(self, isExpand):
+        """ExpandGroupSettingCard 通过箭头的接口调到这里, 问号只需同步选中态。"""
+        self.setChecked(isExpand)
+
+
+class ModelChoiceCard(ExpandGroupSettingCard):
+    """
+    可折叠的选择卡片: 头部是问号和下拉框, 主体是该设置的逐选项说明。
+
+    折叠主体的高度由 ExpandGroupSettingCard._adjustViewSize 按子控件的 sizeHint() 求和
+    得出, 而开了 wordWrap 的 QLabel 在 sizeHint 里只报一行, 文字会被裁掉。所以说明文字
+    自己带换行(在 ini 里写成续行), 也不要改成 setWordWrap(True)。
+    """
+
+    def __init__(self, configItem, icon, title, content, texts, helpText, parent=None):
+        """
+        texts 会和 configItem.options 逐个 zip, 所以两者的顺序和长度必须一致。helpText
+        需要自带换行, 原因见类 docstring。
+        """
+        super().__init__(icon, title, content, parent)
+        self.configItem = configItem
+
+        self._replace_expand_button()
+
+        self.comboBox = ComboBox(self)
+        self.optionToText = {option: text for option, text in zip(configItem.options, texts)}
+        for text, option in zip(texts, configItem.options):
+            self.comboBox.addItem(text, userData=option)
+        self.comboBox.setCurrentText(self.optionToText[configItem.value])
+        self.comboBox.currentIndexChanged.connect(self._onCurrentIndexChanged)
+        configItem.valueChanged.connect(self.setValue)
+        self.card.addWidget(self.comboBox)
+
+        body = QtWidgets.QWidget(self.view)
+        bodyLayout = QtWidgets.QVBoxLayout(body)
+        bodyLayout.setContentsMargins(20, 12, 20, 16)
+        self.helpLabel = QtWidgets.QLabel(helpText, body)
+        self.helpLabel.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        bodyLayout.addWidget(self.helpLabel)
+        self.addGroupWidget(body)
+
+    def _replace_expand_button(self):
+        """
+        把默认的旋转箭头换成问号, 并接管卡片上的事件过滤。
+
+        库的 HeaderSettingCard.eventFilter 在整张卡片收到 QEvent.Enter 时就点亮箭头, 那样
+        鼠标停在卡片任意位置问号都像被悬停。这里只处理按下和松开, 悬停交给按钮自己。
+        """
+        old = self.card.expandButton
+        index = self.card.hBoxLayout.indexOf(old)
+        self.helpButton = HelpIconButton(self.card)
+        self.card.hBoxLayout.insertWidget(index, self.helpButton, 0, QtCore.Qt.AlignRight)
+        self.card.hBoxLayout.removeWidget(old)
+        # 只 removeWidget 不够: 旧按钮仍挂在父控件上且可见, 会一直画在 (0, 0)
+        old.setParent(None)
+        old.deleteLater()
+        self.card.expandButton = self.helpButton
+        self.helpButton.clicked.connect(self.toggleExpand)
+
+        self.card.removeEventFilter(self.card)
+        self.card.installEventFilter(self)
+
+    def eventFilter(self, obj, event):
+        """整张卡片依然可以点击展开, 但不再让卡片去点亮图标。"""
+        if obj is self.card:
+            if event.type() == QtCore.QEvent.MouseButtonPress \
+                    and event.button() == QtCore.Qt.LeftButton:
+                self.helpButton.setPressed(True)
+            elif event.type() == QtCore.QEvent.MouseButtonRelease \
+                    and event.button() == QtCore.Qt.LeftButton:
+                self.helpButton.setPressed(False)
+                self.helpButton.click()
+        return super().eventFilter(obj, event)
+
+    def _onCurrentIndexChanged(self, index: int):
+        qconfig.set(self.configItem, self.comboBox.itemData(index))
+
+    def setValue(self, value):
+        if value not in self.optionToText:
+            return
+        self.comboBox.setCurrentText(self.optionToText[value])
+        qconfig.set(self.configItem, value)
+
 
 class AdvancedSettingInterface(ScrollArea):
     """高级设置页面"""
@@ -44,6 +198,9 @@ class AdvancedSettingInterface(ScrollArea):
         self.setup_layout()
 
     def setup_layout(self):
+        self.advanced_group.addSettingCard(self.det_model)
+        self.advanced_group.addSettingCard(self.rec_model)
+        self.advanced_group.addSettingCard(self.frame_extraction)
         self.advanced_group.addSettingCard(self.rec_batch_number)
         self.advanced_group.addSettingCard(self.max_batch_size)
         self.advanced_group.addSettingCard(self.subtitle_area)
@@ -87,6 +244,35 @@ class AdvancedSettingInterface(ScrollArea):
         # 关于设置组  
         self.about_group = SettingCardGroup(tr["Setting"]["AboutSetting"], self.scrollWidget)
         
+        self.det_model = ModelChoiceCard(
+            configItem=config.detModel,
+            icon=FluentIcon.VIEW,
+            title=tr["Setting"]["DetModel"],
+            content=tr["Setting"]["DetModelDesc"],
+            parent=self.advanced_group,
+            texts=list(config.detModel.validator.options),
+            helpText=tr_fallback("ModelHelp", "DetModel"),
+        )
+        self.rec_model = ModelChoiceCard(
+            configItem=config.recModel,
+            icon=FluentIcon.FONT,
+            title=tr["Setting"]["RecModel"],
+            content=tr["Setting"]["RecModelDesc"],
+            parent=self.advanced_group,
+            texts=list(config.recModel.validator.options),
+            helpText=tr_fallback("ModelHelp", "RecModel"),
+        )
+        self.frame_extraction = ModelChoiceCard(
+            configItem=config.frameExtraction,
+            icon=FluentIcon.SPEED_HIGH,
+            title=tr["Setting"]["FrameExtraction"],
+            content=tr["Setting"]["FrameExtractionDesc"],
+            parent=self.advanced_group,
+            texts=[tr_fallback('FrameExtraction', i)
+                   for i in config.frameExtraction.validator.options],
+            helpText=tr_fallback("ModelHelp", "FrameExtraction"),
+        )
+
         # 每张图中同时识别的文本框数量
         self.rec_batch_number = RangeSettingCard(
             configItem=config.recBatchNumber,

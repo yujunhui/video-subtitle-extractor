@@ -1,9 +1,15 @@
 
+import json
 import os
 from pathlib import Path
 from qfluentwidgets import (qconfig, ConfigItem, QConfig, OptionsValidator, BoolValidator, OptionsConfigItem, 
                             EnumSerializer, RangeValidator, RangeConfigItem, ConfigValidator)
-from backend.tools.constant import SubtitleArea, VideoSubFinderDecoder
+from backend.tools.constant import (
+    SubtitleArea, VideoSubFinderDecoder,
+    DET_MODEL_CHOICES, REC_MODEL_CHOICES, FRAME_EXTRACTION_CHOICES,
+    DEFAULT_DET_MODEL, DEFAULT_REC_MODEL, DEFAULT_FRAME_EXTRACTION,
+    MODE_TO_MODEL_CHOICES,
+)
 import configparser
 
 # 项目版本号
@@ -50,8 +56,11 @@ class Config(QConfig):
 
     # 字幕语言设置
     language = OptionsConfigItem("Main", "Language", "ch", OptionsValidator([name for name in tr["Language"]]))
-    # 识别模式设置
-    mode = OptionsConfigItem("Main", "Mode", "fast",  OptionsValidator(["auto", "fast", "accurate"]))
+    # 检测模型与识别模型, 取代了原先的识别模式(Mode)
+    detModel = OptionsConfigItem("Main", "DetModel", DEFAULT_DET_MODEL, OptionsValidator(DET_MODEL_CHOICES))
+    recModel = OptionsConfigItem("Main", "RecModel", DEFAULT_REC_MODEL, OptionsValidator(REC_MODEL_CHOICES))
+    # 抽帧策略
+    frameExtraction = OptionsConfigItem("Main", "FrameExtraction", DEFAULT_FRAME_EXTRACTION, OptionsValidator(FRAME_EXTRACTION_CHOICES))
     # 是否生成TXT文本字幕
     generateTxt = ConfigItem("Main", "GenerateTxt", False, BoolValidator())
     # 每张图中同时识别6个文本框中的文本，GPU显存越大，该数值可以设置越大
@@ -101,11 +110,65 @@ CONFIG_FILE = 'config/config.json'
 config = Config()
 qconfig.load(CONFIG_FILE, config)
 
+
+def _migrate_mode_to_model_choices():
+    """
+    把旧 config.json 里的 Mode 值迁移到三个新配置项上。
+
+    只要 DetModel / RecModel / FrameExtraction 里有任意一个已经存在就整个跳过, 所以
+    新版本写过的配置不会被覆盖。迁移之后 Mode 键不再被读取, 下次保存配置时会自然消失。
+
+    这个函数在 import 期就跑, 早于任何界面, 并且会通过 qconfig.set() 写盘。所以配置
+    文件损坏或只读都不能把应用带崩: qconfig.load() 容得下这些文件, 这里也必须容得下。
+    """
+    try:
+        if not os.path.exists(CONFIG_FILE):
+            return
+        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            return
+        main = raw.get('Main')
+        if not isinstance(main, dict):
+            return
+        old_mode = main.get('Mode')
+        if old_mode is None:
+            return
+        if any(key in main for key in ('DetModel', 'RecModel', 'FrameExtraction')):
+            return
+        det, rec, extraction = MODE_TO_MODEL_CHOICES.get(
+            old_mode, (DEFAULT_DET_MODEL, DEFAULT_REC_MODEL, DEFAULT_FRAME_EXTRACTION))
+        config.set(config.detModel, det)
+        config.set(config.recModel, rec)
+        config.set(config.frameExtraction, extraction)
+    except Exception as e:
+        print(f"跳过旧配置迁移: {type(e).__name__}: {e}")
+
+
+_migrate_mode_to_model_choices()
+
 # 读取界面语言配置
 tr = configparser.ConfigParser()
 
 TRANSLATION_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'interface', f"{config.interface.value}.ini")
 tr.read(TRANSLATION_FILE, encoding='utf-8')
+
+# 英文翻译。当前界面语言缺某个键时用它兜底, 目前 [ModelHelp] 段只有中英两版。
+_en_tr = configparser.ConfigParser()
+_en_tr.read(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'interface', 'en.ini'), encoding='utf-8')
+
+
+def tr_fallback(section, key):
+    """
+    读取翻译项, 当前界面语言没有时回退到英文。
+
+    中英文都缺就返回空字符串, 不抛异常, 这样调用方不用为"还没翻译的键"加保护。
+    """
+    if tr.has_option(section, key):
+        return tr[section][key]
+    if _en_tr.has_option(section, key):
+        return _en_tr[section][key]
+    return ''
 
 # 项目的base目录
 BASE_DIR = str(Path(os.path.abspath(__file__)).parent)
